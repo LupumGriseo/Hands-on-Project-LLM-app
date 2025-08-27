@@ -1,5 +1,7 @@
-streamlit
-langchain
-openai
-chromadb
-tiktoken
+streamlit>=1.36
+langchain>=0.2.10
+langchain-openai>=0.1.7
+openai>=1.30.0
+tiktoken>=0.7.0
+# only keep chromadb if you actually use it elsewhere:
+chromadb>=0.5.0
