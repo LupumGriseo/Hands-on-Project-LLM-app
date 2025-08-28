@@ -1,44 +1,80 @@
+# --- SQLite patch: must run BEFORE importing chroma/langchain_chroma ---
+import sys
+import pysqlite3 as sqlite3  # ensures required SQLite features for chromadb on Streamlit Cloud
+sys.modules["sqlite3"] = sqlite3
+sys.modules["sqlite3.dbapi2"] = sqlite3.dbapi2
+# ----------------------------------------------------------------------
+
+import os
 import streamlit as st
+
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_text_splitters import CharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
+from langchain_chroma import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 
-def generate_response(uploaded_file, openai_api_key, query_text):
-    if uploaded_file is None:
-        return "Please upload a file."
-    # Read & split
-    raw_text = uploaded_file.getvalue().decode(errors="ignore")
-    splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-    docs = splitter.create_documents([raw_text])
-
-    # Embeddings & vector store
-    embeddings = OpenAIEmbeddings(api_key=openai_api_key, model="text-embedding-3-small")
-    db = Chroma.from_documents(docs, embedding=embeddings)  # requires chromadb installed
-
-    retriever = db.as_retriever()
-
-    # LLM (chat model is recommended now)
-    llm = ChatOpenAI(api_key=openai_api_key, model="gpt-4o-mini", temperature=0)
-
-    qa = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
-    return qa.run(query_text)
-
-# Streamlit UI
 st.set_page_config(page_title="🦜🔗 Ask the Doc App")
 st.title("🦜🔗 Ask the Doc App")
 
-uploaded_file = st.file_uploader("Upload an article", type="txt")
-query_text = st.text_input("Enter your question:", placeholder="Please provide a short summary.", disabled=not uploaded_file)
+def generate_response(uploaded_file, api_key, query_text):
+    # Provide the key for langchain_openai
+    os.environ["OPENAI_API_KEY"] = api_key
 
-result = []
-with st.form("myform", clear_on_submit=True):
-    openai_api_key = st.text_input("OpenAI API Key", type="password", disabled=not (uploaded_file and query_text))
-    submitted = st.form_submit_button("Submit", disabled=not (uploaded_file and query_text))
-    if submitted and openai_api_key.startswith("sk-"):
-        with st.spinner("Calculating..."):
-            response = generate_response(uploaded_file, openai_api_key, query_text)
-            result.append(response)
+    # Read upload
+    uploaded_file.seek(0)
+    raw_text = uploaded_file.read().decode("utf-8", errors="ignore")
+    docs = [Document(page_content=raw_text, metadata={"filename": uploaded_file.name})]
 
-if result:
-    st.info(result[-1])
+    # Split into chunks
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
+
+    # Build vector store
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    vectordb = Chroma.from_documents(chunks, embedding=embeddings)  # in-memory
+    retriever = vectordb.as_retriever()
+
+    # LLM and prompt
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a helpful assistant. Answer ONLY with information present in the provided context. "
+                   "If the answer is not in the context, reply that you don't know."),
+        ("human", "Question: {input}\n\nContext:\n{context}")
+    ])
+
+    doc_chain = create_stuff_documents_chain(llm, prompt)
+    rag_chain = create_retrieval_chain(retriever, doc_chain)
+
+    result = rag_chain.invoke({"input": query_text})
+    return result["answer"]
+
+# Sidebar: API key
+with st.sidebar:
+    st.markdown("#### OpenAI API Key")
+    default_key = st.secrets.get("OPENAI_API_KEY", "")
+    openai_api_key = st.text_input("sk-...", type="password", value=default_key)
+
+# Main inputs
+uploaded_file = st.file_uploader("Upload a .txt file", type="txt")
+query_text = st.text_input(
+    "Enter your question:",
+    placeholder="Please provide a short summary.",
+    disabled=not uploaded_file
+)
+
+# Submit button
+if st.button("Submit", disabled=not (uploaded_file and query_text)):
+    if not openai_api_key:
+        st.error("Please provide your OpenAI API key (or set it in Secrets).")
+    else:
+        with st.spinner("Thinking..."):
+            try:
+                answer = generate_response(uploaded_file, openai_api_key, query_text)
+                st.info(answer)
+            except Exception as e:
+                # Show the full exception to help with debugging if something else pops up
+                st.exception(e)
